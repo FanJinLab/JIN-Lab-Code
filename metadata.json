@@ -1,0 +1,5 @@
+{
+  "name": "GUV-CSV Analytics Studio",
+  "description": "A high-performance interactive application for GUV (Giant Unilamellar Vesicle) data cleaning, filtering, trajectory visualization, and batch curve fitting.",
+  "requestFramePermissions": []
+}
