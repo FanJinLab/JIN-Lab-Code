@@ -7,7 +7,11 @@ import TemporalTrendChart from './components/TemporalTrendChart';
 import InteractiveHistogram from './components/InteractiveHistogram';
 import BoxPlotChart from './components/BoxPlotChart';
 import ScatterPlotGUV from './components/ScatterPlotGUV';
+import MasterCurveChart from './components/MasterCurveChart';
+import RealTimeLogChart from './components/RealTimeLogChart';
+import SimpleDistributionChart from './components/SimpleDistributionChart';
 import { applyCleaning } from './utils/dataProcess';
+import { transformTraceData, transformRealTimeLogData, fitTraceData, TraceFitResult } from './utils/physicsFitting';
 
 interface FilterStep {
   id: string;
@@ -22,6 +26,22 @@ const App: React.FC = () => {
   const [rawData, setRawData] = useState<CSVRow[]>([]);
   const [numericFields, setNumericFields] = useState<string[]>([]);
   
+  // Physics Parameters (Page 3)
+  const [pwValue, setPwValue] = useState(0.0034);
+  const [fitBgValue, setFitBgValue] = useState(0.0);
+  const [fitThreshold, setFitThreshold] = useState(0.001); 
+  const [frameInterval, setFrameInterval] = useState(600.0); // Default dt = 600s as requested
+  const [fitMapping, setFitMapping] = useState({
+    intensity: '',
+    radius: ''
+  });
+  const [fitSelectedGroups, setFitSelectedGroups] = useState<Set<string>>(new Set());
+  
+  // Fit Range: Start with a "pristine" state that allows auto-scaling
+  const [fitRange, setFitRange] = useState<[number, number]>([0, 0]);
+  const [fitResults, setFitResults] = useState<TraceFitResult[]>([]);
+  const [isFitting, setIsFitting] = useState(false);
+
   // Grouping State
   const [xyCounts, setXYCounts] = useState<Record<string, number>>({});
   const [uniqueXYs, setUniqueXYs] = useState<string[]>([]);
@@ -55,28 +75,23 @@ const App: React.FC = () => {
     geometryFields: []
   });
 
-  const resetSession = () => {
-    if (window.confirm("Are you sure you want to start a new session? All current data and filters will be cleared.")) {
-      setRawData([]);
-      setNumericFields([]);
-      setXYCounts({});
-      setUniqueXYs([]);
-      setGroupings({});
-      setVisibleGroups(new Set());
-      setAppliedFilters([]);
-      setAnalyticsVisibleGroups(new Set());
-      setSessionKey(prev => prev + 1);
-      setTab('import');
-      setMapping({
-        id: '__uid',
-        frames: 'Frame',
-        xy: 'XY',
-        sequence: 'Sequence',
-        dt: 1,
-        intensityFields: [],
-        geometryFields: []
-      });
-    }
+  const resetSession = (e?: React.MouseEvent) => {
+    if (e) { e.preventDefault(); e.stopPropagation(); }
+    const confirmed = window.confirm("Are you sure you want to end this session? All current data and filters will be cleared.");
+    if (!confirmed) return;
+
+    setRawData([]);
+    setNumericFields([]);
+    setXYCounts({});
+    setUniqueXYs([]);
+    setGroupings({});
+    setVisibleGroups(new Set());
+    setAppliedFilters([]);
+    setAnalyticsVisibleGroups(new Set());
+    setSessionKey(prev => prev + 1);
+    setFitResults([]);
+    setFitRange([0, 0]);
+    setTab('import');
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -89,7 +104,6 @@ const App: React.FC = () => {
       if (lines.length < 2) return;
       
       const headers = lines[0].split(',').map(h => h.trim());
-      
       const xyColName = headers[0];
       const seqColName = headers[1];
       const idColName = headers[2];
@@ -112,28 +126,23 @@ const App: React.FC = () => {
         const trackId = Number(row[idColName]);
         const uid = `${xyVal}_${trackId}`;
         row.__uid = uid;
-
         if (!xyTrackMap[xyVal]) xyTrackMap[xyVal] = new Set();
         xyTrackMap[xyVal].add(trackId);
         tempRows.push(row);
       }
 
-      const counts: Record<string, number> = {};
-      Object.keys(xyTrackMap).forEach(xy => { counts[xy] = xyTrackMap[xy].size; });
-      
-      setXYCounts(counts);
+      setXYCounts(Object.fromEntries(Object.entries(xyTrackMap).map(([k, v]) => [k, v.size])));
       setNumericFields(channelFields);
       setRawData(tempRows);
-      setUniqueXYs(Object.keys(xyTrackMap).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })));
-      setMapping({
-        xy: xyColName,
-        sequence: seqColName,
-        id: '__uid', 
-        frames: frameColName,
-        dt: 1,
-        intensityFields: channelFields,
-        geometryFields: []
+      setUniqueXYs(Object.keys(xyTrackMap).sort((a, b) => a.localeCompare(b, undefined, { numeric: true })));
+      setMapping({ xy: xyColName, sequence: seqColName, id: '__uid', frames: frameColName, dt: 1, intensityFields: channelFields, geometryFields: [] });
+      
+      // Auto-set fitting defaults
+      setFitMapping({
+        intensity: channelFields[0] || '',
+        radius: channelFields.find(f => f.toLowerCase().includes('radius')) || channelFields[2] || ''
       });
+
       setHistField(channelFields[0]);
       setAnalyticsField(channelFields[0]);
       setAnalyticsXField(channelFields[0]);
@@ -166,31 +175,25 @@ const App: React.FC = () => {
 
     return Object.entries(groupedRows).map(([uid, rows]) => {
       const group = rows[0].__group || 'Default';
-      const xy = String(rows[0][mapping.xy]);
-      const sequence = String(rows[0][mapping.sequence]);
       const stats: Record<string, any> = {};
       const sortedRows = rows.sort((a, b) => Number(a[mapping.frames]) - Number(b[mapping.frames]));
-      
       numericFields.forEach(f => {
-        let min = Infinity, max = -Infinity, sum = 0, count = 0;
-        const vals: number[] = [];
-        rows.forEach(r => {
-          const val = Number(r[f]);
-          if (!isNaN(val)) {
-            if (val < min) min = val;
-            if (val > max) max = val;
-            sum += val;
-            count++;
-            vals.push(val);
-          }
-        });
-        const mean = count > 0 ? sum / count : 0;
-        const variance = count > 0 ? vals.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / count : 0;
+        const vals = rows.map(r => Number(r[f])).filter(v => !isNaN(v));
+        const mean = vals.reduce((a,b)=>a+b,0)/vals.length;
+        const variance = vals.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / vals.length;
         const std = Math.sqrt(variance);
         const cv = mean !== 0 ? std / Math.abs(mean) : 0;
-        stats[f] = { min, max, delta: max - min, mean, variance, cv, first: Number(sortedRows[0][f]), last: Number(sortedRows[sortedRows.length - 1][f]) };
+        stats[f] = { 
+          mean, 
+          variance,
+          cv,
+          min: Math.min(...vals), 
+          max: Math.max(...vals), 
+          first: Number(sortedRows[0][f]), 
+          last: Number(sortedRows[sortedRows.length - 1][f]) 
+        };
       });
-      return { id: uid, group, xy, sequence, duration: rows.length, stats } as TrajectoryFeature;
+      return { id: uid, group, xy: String(rows[0][mapping.xy]), sequence: String(rows[0][mapping.sequence]), duration: rows.length, stats } as TrajectoryFeature;
     });
   }, [cleanedData, mapping, numericFields]);
 
@@ -230,6 +233,10 @@ const App: React.FC = () => {
       Object.keys(plotData[0] || {}).join(','),
       ...plotData.map(row => Object.values(row).join(','))
     ].join('\n');
+    
+    const groupLines = (Object.entries(groupings) as [string, string[]][]).map(([g, xys]) => `- ${g}: [${xys.join(', ')}]`);
+    const filterLines = appliedFilters.map(f => `- ${f.field} (${f.mode}): range [${f.range[0].toFixed(3)}, ${f.range[1].toFixed(3)}]`);
+
     const criteriaContent = [
       'GUV STUDIO ANALYSIS SESSION EXPORT',
       '==================================',
@@ -238,10 +245,10 @@ const App: React.FC = () => {
       `GUV Count (Post-Filter): ${filteredVesicleIDs.size}`,
       '',
       'Condition Grouping Mapping:',
-      ...(Object.entries(groupings) as [string, string[]][]).map(([g, xys]) => `- ${g}: [${xys.join(', ')}]`),
+      ...groupLines,
       '',
       'Filter Logic Pipeline:',
-      ...appliedFilters.map(f => `- ${f.field} (${f.mode}): range [${f.range[0].toFixed(3)}, ${f.range[1].toFixed(3)}]`),
+      ...filterLines,
       `- Final/Current UI Window: ${histField} (${histMode}): [${histRange[0].toFixed(3)}, ${histRange[1].toFixed(3)}]`
     ].join('\n');
 
@@ -290,6 +297,69 @@ const App: React.FC = () => {
     }
   }, [visibleGroups, analyticsVisibleGroups]);
 
+  // Default select all groups for fitting when page loads or groups change
+  useEffect(() => {
+     if (visibleGroups.size > 0 && fitSelectedGroups.size === 0) {
+        setFitSelectedGroups(new Set(visibleGroups));
+     }
+  }, [visibleGroups]);
+
+  // LIVE: Pre-Calculate transformed traces for Visualization (Master Curve)
+  const transformedTraces = useMemo(() => {
+    if (!fitMapping.intensity || !fitMapping.radius || plotData.length === 0) return [];
+    
+    const subset = plotData.filter(row => fitSelectedGroups.has(row.__group || ''));
+    return transformTraceData(subset, mapping, fitMapping.intensity, fitBgValue, fitMapping.radius, pwValue, fitThreshold, frameInterval);
+  }, [plotData, fitSelectedGroups, fitMapping, fitBgValue, pwValue, fitThreshold, mapping, frameInterval]);
+
+  // LIVE: Pre-Calculate Real Time Reduced Data for Visualization
+  const realTimeTraces = useMemo(() => {
+    if (!fitMapping.intensity || plotData.length === 0) return [];
+    const subset = plotData.filter(row => fitSelectedGroups.has(row.__group || ''));
+    return transformRealTimeLogData(subset, mapping, fitMapping.intensity, frameInterval);
+  }, [plotData, fitSelectedGroups, fitMapping, frameInterval, mapping]);
+
+  // Dynamic Calculation of Max Dimensionless Time for Slider Scaling
+  const maxTau = useMemo(() => {
+    if (transformedTraces.length === 0) return 1000;
+    let m = 0;
+    transformedTraces.forEach(t => {
+        if (t.points.length > 0) {
+            const lastP = t.points[t.points.length - 1];
+            if (lastP.tau_w > m) m = lastP.tau_w;
+        }
+    });
+    return Math.max(m, 10); // Return raw max for precise control
+  }, [transformedTraces]);
+
+  // Auto-adapt fit range when maxTau changes (loading new data)
+  useEffect(() => {
+      // If we are resetting or loading new data (where range is [0,0] or smaller than new max), auto-scale.
+      // Or if the current range upper bound is roughly equal to the OLD maxTau, update it to the NEW maxTau.
+      if (fitRange[1] === 0 || fitRange[1] > maxTau || fitRange[1] < maxTau * 0.1) {
+          setFitRange([0, maxTau]);
+      }
+  }, [maxTau]);
+
+  // Clear fits when data changes to avoid visual mismatch
+  useEffect(() => {
+     setFitResults([]); 
+  }, [transformedTraces]);
+
+  // Page 3 Fit Execution Trigger
+  const runBatchFit = () => {
+    if (transformedTraces.length === 0) return;
+    
+    setIsFitting(true);
+    setTimeout(() => {
+        // Pass fitThreshold to fitting function for clamping
+        // Ensure we pass the CURRENT fitRange
+        const results = fitTraceData(transformedTraces, fitRange, pwValue, fitThreshold);
+        setFitResults(results);
+        setIsFitting(false);
+    }, 100);
+  };
+
   const renderImport = () => (
     <div className="p-10 max-w-7xl mx-auto h-full overflow-y-auto space-y-10 pb-24">
       <div className="bg-white rounded-[40px] shadow-2xl border border-slate-100 p-16 text-center">
@@ -297,19 +367,9 @@ const App: React.FC = () => {
           <div className="flex flex-col items-center">
             <div className="w-24 h-24 bg-blue-50 text-blue-600 rounded-full flex items-center justify-center mb-8 shadow-inner text-4xl">📥</div>
             <h2 className="text-4xl font-black text-slate-900 mb-4 tracking-tighter">1. Load GUV Trajectory Data</h2>
-            <p className="text-slate-500 mb-8 text-lg font-medium max-w-md mx-auto leading-relaxed">
-              Standard format required: <br/> 
-              <span className="font-mono text-sm bg-slate-50 px-2 py-1 rounded">XY, Sequence, Track ID, Frame, [Channel Fields...]</span>
-            </p>
-            <input 
-              key={`file-upload-${sessionKey}`} 
-              type="file" 
-              id="csv-upload" 
-              className="hidden" 
-              onChange={handleFileUpload} 
-              accept=".csv,.txt" 
-            />
-            <label htmlFor="csv-upload" className="bg-blue-600 text-white px-16 py-6 rounded-3xl font-black cursor-pointer hover:bg-blue-700 transition-all shadow-2xl hover:shadow-blue-200 active:scale-95">Select CSV File</label>
+            <p className="text-slate-500 mb-8 text-lg font-medium max-w-md mx-auto leading-relaxed">Required: XY, Sequence, ID, Frame, [Channels...]</p>
+            <input key={`file-upload-input-${sessionKey}`} type="file" id="csv-upload-main" className="hidden" onChange={handleFileUpload} accept=".csv,.txt" />
+            <label htmlFor="csv-upload-main" className="bg-blue-600 text-white px-16 py-6 rounded-3xl font-black cursor-pointer hover:bg-blue-700 transition-all shadow-2xl active:scale-95">Select CSV File</label>
           </div>
         ) : (
           <div className="flex items-center justify-center space-x-12 animate-in fade-in duration-300">
@@ -317,81 +377,56 @@ const App: React.FC = () => {
                 <p className="text-[10px] text-emerald-600 font-black uppercase tracking-widest mb-1">Status</p>
                 <p className="text-2xl font-black text-emerald-900">{rawData.length.toLocaleString()} points / {uniqueXYs.length} FOVs</p>
              </div>
-             <button onClick={resetSession} className="bg-white text-red-500 border border-red-100 bg-red-50/50 px-8 py-5 rounded-3xl font-black uppercase tracking-widest text-xs hover:bg-red-50 transition-all shadow-xl active:scale-95">Start New Session</button>
+             <button onClick={(e) => resetSession(e)} className="bg-red-500 text-white px-8 py-5 rounded-3xl font-black uppercase tracking-widest text-xs hover:bg-red-600 transition-all shadow-xl active:scale-95">Restart Session</button>
           </div>
         )}
       </div>
 
       {rawData.length > 0 && (
-        <div className="bg-white rounded-[40px] shadow-2xl border border-slate-100 overflow-hidden animate-in slide-in-from-bottom-5 duration-500">
+        <div className="bg-white rounded-[40px] shadow-2xl border border-slate-100 overflow-hidden">
           <div className="p-10 border-b border-slate-50 bg-slate-50/30 flex justify-between items-center">
             <div>
               <h2 className="text-3xl font-black text-slate-900 tracking-tighter">2. FOV Assignment</h2>
               <p className="text-sm text-slate-400 font-bold uppercase tracking-tighter mt-1">Group XY positions into conditions</p>
             </div>
             <div className="flex space-x-4">
-              <input type="text" value={newGroupName} onChange={e => setNewGroupName(e.target.value)} placeholder="Condition Label..." className="px-6 py-4 bg-white border border-slate-200 rounded-2xl text-sm outline-none focus:ring-4 ring-blue-50 transition-all" />
-              <button onClick={() => { if(newGroupName.trim()){ setGroupings(prev => ({...prev, [newGroupName]: []})); setNewGroupName(''); } }} className="bg-slate-900 text-white px-8 py-4 rounded-2xl text-sm font-black hover:bg-slate-800 shadow-xl active:scale-95">Add Group</button>
+              <input type="text" value={newGroupName} onChange={e => setNewGroupName(e.target.value)} placeholder="Condition Label..." className="px-6 py-4 bg-white border border-slate-200 rounded-2xl text-sm outline-none" />
+              <button onClick={() => { if(newGroupName.trim()){ setGroupings(prev => ({...prev, [newGroupName]: []})); setNewGroupName(''); } }} className="bg-slate-900 text-white px-8 py-4 rounded-2xl text-sm font-black">Add Group</button>
             </div>
           </div>
-          
-          <div className="p-10 grid grid-cols-12 gap-12">
-            <div className="col-span-5 flex flex-col space-y-6">
-               <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest px-2 flex justify-between">Source XY Positions <span>({uniqueXYs.length})</span></h3>
-               <div className="bg-slate-50/50 rounded-3xl p-8 border border-slate-100 h-[500px] overflow-y-auto grid grid-cols-1 gap-4 content-start scrollbar-hide">
-                  {uniqueXYs.map(xy => {
+          <div className="p-10 grid grid-cols-12 gap-12 h-[600px]">
+             <div className="col-span-5 flex flex-col space-y-4 overflow-y-auto pr-4 scrollbar-hide">
+                {uniqueXYs.map(xy => {
                     const group = (Object.entries(groupings) as [string, string[]][]).find(([_, xys]) => xys.includes(xy))?.[0];
                     return (
-                      <div key={xy} className="flex items-center justify-between p-4 bg-white rounded-2xl border border-slate-200 shadow-sm hover:border-blue-300 transition-all group">
-                        <div className="flex flex-col">
-                          <span className="text-[12px] font-black text-slate-900">FOV {xy}</span>
-                          <span className="text-[10px] text-slate-400 font-bold uppercase">{xyCounts[xy]} GUVs</span>
+                        <div key={xy} className="p-4 bg-white border rounded-2xl flex justify-between items-center shadow-sm">
+                            <span className="text-xs font-black">FOV {xy} ({xyCounts[xy]} GUVs)</span>
+                            <select value={group || ""} onChange={(e) => setGroupings(prev => {
+                                const n = {...prev}; Object.keys(n).forEach(g => n[g] = n[g].filter(i => i !== xy));
+                                if (e.target.value) n[e.target.value] = [...n[e.target.value], xy];
+                                return n;
+                            })} className="text-[10px] font-bold bg-slate-50 px-2 py-1 rounded">
+                                <option value="">None</option>
+                                {Object.keys(groupings).map(gn => <option key={gn} value={gn}>{gn}</option>)}
+                            </select>
                         </div>
-                        <select 
-                          value={group || ""} 
-                          onChange={(e) => {
-                            const gn = e.target.value;
-                            setGroupings(prev => {
-                              const n = {...prev};
-                              Object.keys(n).forEach(g => { n[g] = n[g].filter(i => i !== xy); });
-                              if (gn) n[gn] = [...n[gn], xy];
-                              return n;
-                            });
-                          }} 
-                          className="text-xs font-bold bg-slate-50 text-blue-600 outline-none px-4 py-2 rounded-xl border-none appearance-none cursor-pointer"
-                        >
-                          <option value="">(None)</option>
-                          {Object.keys(groupings).map(gn => <option key={gn} value={gn}>{gn}</option>)}
-                        </select>
-                      </div>
                     );
-                  })}
-               </div>
-            </div>
-
-            <div className="col-span-7 flex flex-col space-y-6">
-               <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest px-2">Experimental Groups</h3>
-               <div className="grid grid-cols-2 gap-6 h-[500px] overflow-y-auto pr-2 scrollbar-hide">
-                 {Object.keys(groupings).map((gn, i) => (
-                    <div key={gn} className="bg-white p-8 rounded-[35px] border border-slate-100 shadow-lg flex flex-col group border-b-8" style={{ borderBottomColor: GROUP_COLORS[i % GROUP_COLORS.length] }}>
-                      <div className="flex justify-between items-start mb-6">
-                        <div>
-                          <h4 className="font-black text-xl text-slate-900">{gn}</h4>
-                          <span className="text-[10px] bg-slate-50 text-slate-400 px-3 py-1 rounded-full font-black uppercase mt-1 inline-block">{groupings[gn].length} XYs</span>
-                        </div>
-                        <button onClick={() => setGroupings(prev => { const n = {...prev}; delete n[gn]; return n; })} className="text-red-300 hover:text-red-500 text-lg">×</button>
-                      </div>
-                      <div className="flex-1 text-[11px] text-slate-400 font-mono leading-relaxed overflow-y-auto scrollbar-hide">{groupings[gn].join(', ') || <span className="italic text-slate-300">No FOVs assigned...</span>}</div>
+                })}
+             </div>
+             <div className="col-span-7 grid grid-cols-2 gap-6 overflow-y-auto pr-4 scrollbar-hide">
+                {Object.keys(groupings).map((gn, i) => (
+                    <div key={gn} className="bg-white p-8 rounded-[35px] border border-slate-100 shadow-lg border-b-8" style={{ borderBottomColor: GROUP_COLORS[i % GROUP_COLORS.length] }}>
+                        <h4 className="font-black text-xl mb-4">{gn} ({groupings[gn].length} FOVs)</h4>
+                        <div className="text-[10px] text-slate-400 font-mono truncate">{groupings[gn].join(', ')}</div>
                     </div>
-                 ))}
-               </div>
-            </div>
+                ))}
+             </div>
           </div>
-          <div className="p-10 bg-slate-50/50 border-t border-slate-100 flex justify-end">
+          <div className="p-10 bg-slate-50/50 flex justify-end">
             <button 
               onClick={() => { if(Object.keys(groupings).length > 0) { setVisibleGroups(new Set(Object.keys(groupings))); setTab('filter'); } }} 
               disabled={Object.keys(groupings).length === 0}
-              className={`px-16 py-5 rounded-3xl font-black shadow-2xl transition-all active:scale-95 ${Object.keys(groupings).length > 0 ? 'bg-blue-600 text-white hover:bg-blue-700' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
+              className={`px-16 py-5 rounded-3xl font-black shadow-2xl active:scale-95 transition-all ${Object.keys(groupings).length > 0 ? 'bg-blue-600 text-white' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
             >
               Start Cleansing →
             </button>
@@ -402,241 +437,411 @@ const App: React.FC = () => {
   );
 
   const renderFilter = () => (
-    <div className="flex flex-col h-full bg-slate-50 overflow-hidden">
-      <div className="px-10 py-5 bg-white border-b border-slate-200 flex flex-col shadow-sm z-20">
-        <div className="flex justify-between items-center mb-4">
-          <div className="flex items-center space-x-4">
-             <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Active Filters:</span>
-             <div className="flex space-x-3">
-               {Object.keys(groupings).map((gn, i) => (
-                 <label key={gn} className={`flex items-center px-5 py-2 rounded-2xl border-2 text-[11px] font-black cursor-pointer transition-all ${visibleGroups.has(gn) ? 'bg-white shadow-md' : 'bg-slate-50 border-transparent text-slate-300'}`} style={{ borderColor: visibleGroups.has(gn) ? GROUP_COLORS[i % GROUP_COLORS.length] : 'transparent', color: visibleGroups.has(gn) ? GROUP_COLORS[i % GROUP_COLORS.length] : 'inherit' }}>
-                   <input type="checkbox" className="hidden" checked={visibleGroups.has(gn)} onChange={() => { const n = new Set(visibleGroups); if(n.has(gn)) n.delete(gn); else n.add(gn); setVisibleGroups(n); }} />
-                   <span>{gn}</span>
-                 </label>
-               ))}
-             </div>
-          </div>
-          <div className="flex items-center space-x-6">
-             <button onClick={downloadDataAndCriteria} className="text-[10px] font-black bg-blue-50 text-blue-600 px-5 py-2.5 rounded-xl border border-blue-100 hover:bg-blue-100 transition-all uppercase tracking-widest">Download Data + Report</button>
-             <div className="text-right">
-                <p className="text-[10px] text-slate-400 font-black uppercase tracking-widest">Compliance Subset</p>
-                <p className="text-2xl font-black text-slate-900 leading-none">{filteredVesicleIDs.size} <span className="text-slate-200 font-normal">/ {trackFeatures.length} GUVs</span></p>
-             </div>
-          </div>
+    <div className="p-10 h-full bg-slate-50 overflow-y-auto space-y-12 pb-32">
+      <div className="max-w-7xl mx-auto space-y-10">
+        <div className="flex justify-between items-end">
+           <div>
+             <h2 className="text-4xl font-black text-slate-900 tracking-tighter">2. Clean & Filter Data</h2>
+             <p className="text-sm text-slate-400 font-bold uppercase mt-2 tracking-widest">Remove outliers and select specific populations</p>
+           </div>
+           <div className="flex space-x-4">
+              <button onClick={() => { setAppliedFilters([]); setHistRange([0,0]); }} className="text-red-500 font-black text-[10px] uppercase hover:underline">Reset All Filters</button>
+              <button onClick={downloadDataAndCriteria} className="bg-slate-900 text-white px-8 py-4 rounded-2xl text-[11px] font-black uppercase shadow-xl active:scale-95 transition-all">Export Cleaned Data</button>
+           </div>
         </div>
 
-        {appliedFilters.length > 0 && (
-          <div className="flex items-center space-x-4 pt-4 border-t border-slate-50">
-            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Pipeline Stack:</span>
-            <div className="flex flex-wrap gap-3">
-              {appliedFilters.map(f => (
-                <div key={f.id} className="flex items-center space-x-3 bg-blue-50 border border-blue-100 px-4 py-1.5 rounded-xl">
-                  <span className="text-[11px] font-black text-blue-600 uppercase">{f.field} ({f.mode})</span>
-                  <span className="text-[10px] text-blue-400 font-mono">[{f.range[0].toFixed(2)} - {f.range[1].toFixed(2)}]</span>
-                  <button onClick={() => setAppliedFilters(prev => prev.filter(x => x.id !== f.id))} className="text-blue-300 hover:text-red-500 font-bold ml-1">×</button>
-                </div>
-              ))}
-              <button onClick={() => setAppliedFilters([])} className="text-[10px] font-black text-red-500 hover:bg-red-50 px-3 py-1 rounded-xl transition-all">Reset Stack</button>
-            </div>
-          </div>
-        )}
-      </div>
+        <div className="grid grid-cols-12 gap-8 h-[600px]">
+           {/* Left Column: Histogram & Controls */}
+           <div className="col-span-4 flex flex-col space-y-8">
+              <div className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-xl flex-1 flex flex-col">
+                 <div className="flex justify-between items-center mb-6">
+                    <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Parameter Distribution</h4>
+                    <div className="flex space-x-2">
+                       <button onClick={() => setHistScale('linear')} className={`px-3 py-1 rounded-lg text-[9px] font-black uppercase ${histScale === 'linear' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-400'}`}>Lin</button>
+                       <button onClick={() => setHistScale('log')} className={`px-3 py-1 rounded-lg text-[9px] font-black uppercase ${histScale === 'log' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-400'}`}>Log</button>
+                    </div>
+                 </div>
+                 
+                 <div className="space-y-4 mb-6">
+                    <div className="space-y-1">
+                       <label className="text-[9px] font-black text-slate-300 uppercase ml-2">Metric</label>
+                       <select value={histField} onChange={e => setHistField(e.target.value)} className="w-full bg-slate-50 border-none rounded-xl px-4 py-3 text-xs font-bold outline-none focus:ring-2 ring-blue-100">
+                          {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
+                       </select>
+                    </div>
+                    <div className="space-y-1">
+                       <label className="text-[9px] font-black text-slate-300 uppercase ml-2">Statistic</label>
+                       <select value={histMode} onChange={e => setHistMode(e.target.value as any)} className="w-full bg-slate-50 border-none rounded-xl px-4 py-3 text-xs font-bold outline-none focus:ring-2 ring-blue-100">
+                          <option value="mean">Mean Value</option>
+                          <option value="first">Initial Value</option>
+                          <option value="last">Final Value</option>
+                          <option value="min">Minimum</option>
+                          <option value="max">Maximum</option>
+                          <option value="variance">Variance</option>
+                          <option value="cv">Coef. of Variation</option>
+                       </select>
+                    </div>
+                 </div>
 
-      <div className="flex-1 p-10 grid grid-cols-12 gap-10 overflow-hidden">
-        <div className="col-span-7 bg-white rounded-[40px] border border-slate-100 shadow-2xl flex flex-col overflow-hidden">
-          <div className="p-8 border-b border-slate-50 flex justify-between items-center bg-slate-50/30">
-            <div>
-              <h4 className="text-md font-black text-slate-900 uppercase tracking-tight">Kinetic Population</h4>
-              <p className="text-[10px] text-slate-400 font-bold uppercase mt-1 tracking-widest">Sampling kinetics from filtered subset</p>
-            </div>
-            <select value={histField} onChange={e => setHistField(e.target.value)} className="text-[11px] font-black bg-white border border-slate-200 px-5 py-2.5 rounded-2xl outline-none text-blue-600 shadow-sm focus:ring-4 ring-blue-50 transition-all">
-              {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
-            </select>
-          </div>
-          <div className="flex-1 p-6"><TemporalTrendChart data={plotData} field={histField} frameField={mapping.frames} idField={mapping.id} /></div>
-        </div>
+                 <div className="flex-1 min-h-[200px]">
+                    <InteractiveHistogram 
+                       features={trackFeatures.filter((tf: TrajectoryFeature) => visibleGroups.has(tf.group))} 
+                       field={histField} 
+                       mode={histMode} 
+                       scale={histScale} 
+                       range={histRange} 
+                       onRangeChange={setHistRange} 
+                    />
+                 </div>
 
-        <div className="col-span-5 bg-white rounded-[40px] border border-slate-100 shadow-2xl flex flex-col overflow-hidden">
-          <div className="p-8 border-b border-slate-50 bg-slate-50/30">
-            <div className="flex justify-between items-start mb-6">
-              <h4 className="text-md font-black text-slate-900 uppercase tracking-tight">Interactive Filtering</h4>
-              <button onClick={applyCurrentFilter} className="bg-blue-600 text-white px-6 py-3 rounded-2xl text-[11px] font-black uppercase shadow-xl hover:bg-blue-700 active:scale-95 transition-all">Apply Filter</button>
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-1">
-                <label className="text-[9px] font-black text-slate-400 uppercase ml-2">Channel</label>
-                <select value={histField} onChange={e => setHistField(e.target.value)} className="w-full text-[11px] font-black bg-white border border-slate-200 px-5 py-3 rounded-2xl outline-none text-blue-600">
-                  {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
-                </select>
+                 <button onClick={applyCurrentFilter} className="w-full mt-6 bg-blue-600 text-white py-4 rounded-2xl font-black text-xs uppercase shadow-lg hover:bg-blue-500 transition-all active:scale-95">
+                    Apply Filter Window
+                 </button>
               </div>
-              <div className="space-y-1">
-                <label className="text-[9px] font-black text-slate-400 uppercase ml-2">Metric</label>
-                <select value={histMode} onChange={e => setHistMode(e.target.value as any)} className="w-full text-[11px] font-black bg-white border border-slate-200 px-5 py-3 rounded-2xl outline-none text-blue-600">
-                  <option value="first">Initial Value</option>
-                  <option value="last">Final Value</option>
-                  <option value="mean">Mean</option>
-                  <option value="max">Max Val</option>
-                  <option value="min">Min Val</option>
-                  <option value="variance">Var</option>
-                  <option value="cv">CV (Fluct)</option>
-                </select>
+
+              {/* Applied Filters List */}
+              <div className="bg-slate-900 p-8 rounded-[40px] text-white shadow-2xl min-h-[150px]">
+                 <h4 className="text-[10px] font-black text-blue-400 uppercase tracking-widest mb-4">Active Filters ({appliedFilters.length})</h4>
+                 <div className="space-y-2 max-h-[120px] overflow-y-auto pr-2">
+                    {appliedFilters.length === 0 && <p className="text-[10px] text-slate-600 italic">No filters applied yet.</p>}
+                    {appliedFilters.map((f, i) => (
+                       <div key={i} className="flex justify-between items-center bg-slate-800 px-3 py-2 rounded-xl border border-slate-700">
+                          <div className="flex flex-col">
+                             <span className="text-[10px] font-bold text-slate-300">{f.field} <span className="text-slate-500">({f.mode})</span></span>
+                             <span className="text-[9px] font-mono text-blue-400">{f.range[0].toFixed(2)} - {f.range[1].toFixed(2)}</span>
+                          </div>
+                          <button onClick={() => setAppliedFilters(prev => prev.filter((_, idx) => idx !== i))} className="text-slate-500 hover:text-red-400 transition-colors">×</button>
+                       </div>
+                    ))}
+                 </div>
               </div>
-            </div>
-          </div>
-          <div className="flex-1 p-10 pb-6">
-             {visibleGroups.size > 0 ? (
-                <InteractiveHistogram 
-                  features={trackFeatures.filter((f: TrajectoryFeature) => visibleGroups.has(f.group))} 
-                  field={histField} 
-                  mode={histMode} 
-                  scale={histScale} 
-                  range={histRange} 
-                  onRangeChange={setHistRange} 
-                />
-             ) : (
-                <div className="h-full flex items-center justify-center border-2 border-dashed border-slate-100 rounded-[30px] text-slate-300 font-bold uppercase text-[10px] tracking-widest text-center p-12">
-                   Select conditions above to enable filtering
-                </div>
-             )}
-          </div>
-          <div className="p-8 bg-slate-50/50 border-t border-slate-50 flex flex-col space-y-4">
-             <div className="flex space-x-2">
-                <button onClick={() => setHistScale('linear')} className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${histScale === 'linear' ? 'bg-slate-900 text-white shadow-lg' : 'bg-white text-slate-400 border border-slate-200'}`}>Linear</button>
-                <button onClick={() => setHistScale('log')} className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase transition-all ${histScale === 'log' ? 'bg-slate-900 text-white shadow-lg' : 'bg-white text-slate-400 border border-slate-200'}`}>Log10</button>
-             </div>
-             <button onClick={() => setTab('analytics')} className="w-full bg-emerald-600 text-white py-4 rounded-2xl font-black uppercase text-xs shadow-xl hover:bg-emerald-700 active:scale-95 transition-all">Group Analytics →</button>
-          </div>
+           </div>
+
+           {/* Right Column: Time Series Visualization */}
+           <div className="col-span-8 bg-white p-12 rounded-[50px] border border-slate-100 shadow-2xl flex flex-col relative overflow-hidden">
+               <div className="absolute top-0 right-0 p-8 flex space-x-2 z-10">
+                  {Array.from(visibleGroups).map((gn, i) => (
+                     <div key={gn} className="flex items-center space-x-2 bg-slate-50 px-3 py-1 rounded-full border border-slate-100">
+                        <div className="w-2 h-2 rounded-full" style={{ backgroundColor: GROUP_COLORS[i % GROUP_COLORS.length] }}></div>
+                        <span className="text-[9px] font-black text-slate-500">{gn}</span>
+                     </div>
+                  ))}
+               </div>
+               
+               <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-8 border-b pb-4">
+                  Live Trajectory Preview 
+                  <span className="text-blue-600 ml-2">({filteredVesicleIDs.size} GUVs)</span>
+               </h4>
+               
+               <div className="flex-1">
+                  <TemporalTrendChart 
+                     data={plotData} 
+                     field={histField} 
+                     frameField={mapping.frames} 
+                     idField={mapping.id} 
+                  />
+               </div>
+               
+               <div className="mt-6 flex justify-between items-center text-[10px] font-bold text-slate-400 bg-slate-50 p-4 rounded-2xl">
+                  <span>Filtered Data Points: {plotData.length.toLocaleString()}</span>
+                  <span>Avg Duration: {trackFeatures.length > 0 ? Math.round(trackFeatures.reduce((a: number, b: TrajectoryFeature) => a + b.duration, 0) / trackFeatures.length) : 0} frames</span>
+               </div>
+           </div>
         </div>
       </div>
     </div>
   );
 
-  const renderAnalytics = () => {
-    const boxData = Array.from(analyticsVisibleGroups).map(gn => {
-      const vals = trackFeatures
-        .filter((tf: TrajectoryFeature) => tf.group === gn && filteredVesicleIDs.has(String(tf.id)))
-        .map((tf: TrajectoryFeature) => tf.stats[analyticsField]?.[analyticsMode])
-        .filter(v => v != null && !isNaN(v));
-      return { group: gn, values: vals };
-    });
-
-    const activeTrackFeatures = trackFeatures.filter((tf: TrajectoryFeature) => filteredVesicleIDs.has(String(tf.id)));
+  const renderFitting = () => {
+    // Data for histograms
+    const pfData = fitResults.map(r => ({ group: r.group, value: r.pf_val }));
+    const r2Data = fitResults.map(r => ({ group: r.group, value: r.r2 }));
 
     return (
-      <div className="p-10 h-full bg-slate-50 overflow-y-auto space-y-12 pb-32">
-        <div className="max-w-7xl mx-auto space-y-12">
-          {/* Box Plot Section */}
-          <div className="space-y-6">
-            <div className="flex justify-between items-end">
-               <div>
-                 <h2 className="text-4xl font-black text-slate-900 tracking-tighter">1. Population Distribution</h2>
-                 <p className="text-sm text-slate-400 font-bold uppercase mt-2 tracking-widest">Statistical comparison between conditions</p>
-               </div>
-               <div className="flex space-x-4 bg-white p-4 rounded-3xl shadow-xl border border-slate-100">
-                 <div className="space-y-1">
-                   <label className="text-[9px] font-black text-slate-400 uppercase ml-2">Field</label>
-                   <select value={analyticsField} onChange={e => setAnalyticsField(e.target.value)} className="text-xs font-black border-none bg-slate-50 rounded-xl px-4 py-2 outline-none text-blue-600">
-                     {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
-                   </select>
-                 </div>
-                 <div className="space-y-1">
-                   <label className="text-[9px] font-black text-slate-400 uppercase ml-2">Mode</label>
-                   <select value={analyticsMode} onChange={e => setAnalyticsMode(e.target.value as any)} className="text-xs font-black border-none bg-slate-50 rounded-xl px-4 py-2 outline-none text-blue-600">
-                     <option value="first">Initial</option><option value="last">Final</option><option value="mean">Mean</option><option value="variance">Var</option><option value="cv">CV</option>
-                   </select>
-                 </div>
-                 <button onClick={() => exportChartAsPng('boxplot-container', 'guv_boxplots.png')} className="bg-slate-900 text-white px-5 py-2 rounded-xl text-[10px] font-black uppercase self-end shadow-lg hover:bg-slate-800 transition-all">Export PNG</button>
-               </div>
-            </div>
-            <div className="grid grid-cols-12 gap-8">
-               <div id="boxplot-container" className="col-span-8 bg-white p-12 rounded-[50px] border border-slate-100 h-[600px] shadow-2xl flex flex-col relative">
-                 <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-10 border-b border-slate-50 pb-4 flex justify-between">
-                   Distribution Over Conditions
-                   <span className="text-blue-500 lowercase font-mono">(*p &lt; 0.05 **p &lt; 0.01 ***p &lt; 0.001)</span>
-                 </h4>
-                 <div className="flex-1"><BoxPlotChart data={boxData} /></div>
-               </div>
-               <div className="col-span-4 bg-white p-10 rounded-[50px] border border-slate-100 shadow-2xl overflow-y-auto max-h-[600px] scrollbar-hide">
-                  <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest border-b pb-4 mb-6">Pairwise Significance Matrix</h4>
-                  <div className="space-y-4">
-                    {boxData.map((g1, idx) => (
-                      boxData.slice(idx + 1).map(g2 => {
-                         const mean1 = g1.values.length > 0 ? g1.values.reduce((a,b)=>a+b,0)/g1.values.length : 0;
-                         const mean2 = g2.values.length > 0 ? g2.values.reduce((a,b)=>a+b,0)/g2.values.length : 0;
-                         const diff = Math.abs(mean1 - mean2);
-                         return (
-                           <div key={`${g1.group}-${g2.group}`} className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex justify-between items-center group hover:border-blue-200 transition-all">
-                             <div className="flex flex-col">
-                               <span className="text-[11px] font-black text-slate-800">{g1.group} vs {g2.group}</span>
-                               <span className="text-[9px] text-slate-400 uppercase font-bold tracking-tighter mt-0.5">Mean Diff: {diff.toFixed(2)}</span>
-                             </div>
-                             <span className="text-blue-600 font-black text-sm">***</span>
-                           </div>
-                         );
-                      })
-                    ))}
-                    {boxData.length < 2 && <p className="text-[10px] text-slate-300 italic">Add more groups to visualize matrix...</p>}
+      <div className="p-10 h-full bg-slate-50 overflow-y-auto space-y-8 pb-32">
+        <div className="max-w-7xl mx-auto space-y-6">
+          <div className="flex justify-between items-end">
+             <div>
+               <h2 className="text-4xl font-black text-slate-900 tracking-tighter">3. Permeability Fitting</h2>
+               <div className="flex items-center space-x-6 mt-2">
+                  <p className="text-sm text-slate-400 font-bold uppercase tracking-widest">Master curve dimensionless transformation</p>
+                  <div className="bg-white border border-slate-200 px-4 py-1 rounded-full shadow-sm">
+                      <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest mr-2">Filtered Tracks:</span>
+                      <span className="text-sm font-black text-blue-600">{filteredVesicleIDs.size}</span>
                   </div>
                </div>
-            </div>
+             </div>
+             <div className="flex space-x-4">
+                <button onClick={() => {
+                  const csv = "ID,Group,Pf_val,R2\n" + fitResults.map(r => `${r.id},${r.group},${r.pf_val},${r.r2}`).join('\n');
+                  const blob = new Blob([csv], { type: 'text/csv' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url; a.download = 'fitting_results.csv'; a.click();
+                }} className="bg-emerald-600 text-white px-6 py-3 rounded-2xl text-[10px] font-black uppercase shadow-xl active:scale-95 transition-all">Download Fit CSV</button>
+             </div>
           </div>
 
-          <div className="space-y-6">
-            <div className="flex justify-between items-end">
-               <div>
-                 <h2 className="text-4xl font-black text-slate-900 tracking-tighter">2. 2D Behavior Mapping</h2>
-                 <p className="text-sm text-slate-400 font-bold uppercase mt-2 tracking-widest">Map global trajectory features for individual GUVs</p>
-               </div>
-               <div className="flex space-x-4 bg-white p-4 rounded-3xl shadow-xl border border-slate-100">
-                 <div className="space-y-1 flex flex-col">
-                    <label className="text-[9px] font-black text-slate-400 uppercase ml-2">X-Axis</label>
-                    <div className="flex space-x-1">
-                      <select value={analyticsXField} onChange={e => setAnalyticsXField(e.target.value)} className="text-[10px] font-black bg-slate-50 rounded-lg px-2 py-1 outline-none">
-                        {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
-                      </select>
-                      <select value={analyticsXMode} onChange={e => setAnalyticsXMode(e.target.value as any)} className="text-[10px] font-black bg-slate-50 rounded-lg px-2 py-1 outline-none">
-                        <option value="first">Ini</option><option value="last">Fin</option><option value="mean">Avg</option><option value="variance">Var</option>
-                      </select>
-                    </div>
-                 </div>
-                 <div className="space-y-1 flex flex-col">
-                    <label className="text-[9px] font-black text-slate-400 uppercase ml-2">Y-Axis</label>
-                    <div className="flex space-x-1">
-                      <select value={analyticsYField} onChange={e => setAnalyticsYField(e.target.value)} className="text-[10px] font-black bg-slate-50 rounded-lg px-2 py-1 outline-none">
-                        {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
-                      </select>
-                      <select value={analyticsYMode} onChange={e => setAnalyticsYMode(e.target.value as any)} className="text-[10px] font-black bg-slate-50 rounded-lg px-2 py-1 outline-none">
-                        <option value="first">Ini</option><option value="last">Fin</option><option value="mean">Avg</option><option value="variance">Var</option>
-                      </select>
-                    </div>
-                 </div>
-                 <button onClick={() => exportChartAsPng('scatterplot-guv-container', 'guv_scatter_2d.png')} className="bg-slate-900 text-white px-5 py-2 rounded-xl text-[10px] font-black uppercase self-end shadow-lg hover:bg-slate-800 transition-all">Export PNG</button>
-               </div>
+          <div className="h-[750px] grid grid-cols-12 gap-6">
+            {/* LEFT COLUMN: Full Height Master Curve Chart (2:5 ratio) */}
+            <div className="col-span-4 h-full bg-white p-6 rounded-[40px] border border-slate-100 shadow-2xl flex flex-col relative overflow-hidden">
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest border-b pb-4 mb-4 flex justify-between">
+                    <span>Population Master Curve</span>
+                    <span>{fitResults.length > 0 ? 'Fit Complete' : 'Ready'}</span>
+                </h4>
+                <div className="flex-1">
+                    <MasterCurveChart 
+                        traces={transformedTraces}
+                        fitResults={fitResults} 
+                        fitRange={fitRange}
+                        setFitRange={setFitRange}
+                        maxTau={maxTau}
+                        threshold={fitThreshold}
+                    />
+                </div>
             </div>
-            <div className="grid grid-cols-12 gap-8">
-               <div className="col-span-3 bg-white p-8 rounded-[35px] border border-slate-100 shadow-xl space-y-6">
-                  <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest border-b pb-2">Visible Groups</h4>
-                  <div className="space-y-3">
-                    {Object.keys(groupings).map((gn, i) => (
-                      <label key={gn} className="flex items-center space-x-3 cursor-pointer group">
-                        <input 
-                          type="checkbox" 
-                          className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" 
-                          checked={analyticsVisibleGroups.has(gn)} 
-                          onChange={() => { const n = new Set(analyticsVisibleGroups); if(n.has(gn)) n.delete(gn); else n.add(gn); setAnalyticsVisibleGroups(n); }} 
-                        />
-                        <span className="text-[11px] font-bold text-slate-700 group-hover:text-blue-600 transition-all flex items-center">
-                          <div className="w-2 h-2 rounded-full mr-2" style={{ backgroundColor: GROUP_COLORS[i % GROUP_COLORS.length] }}></div>
-                          {gn}
-                        </span>
-                      </label>
+
+            {/* MIDDLE COLUMN: New Real Time Log Chart (2:5 ratio) */}
+            <div className="col-span-4 h-full bg-white p-6 rounded-[40px] border border-slate-100 shadow-2xl flex flex-col relative overflow-hidden">
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest border-b pb-4 mb-4">
+                    <span>Real Time Comparison</span>
+                </h4>
+                <div className="flex-1">
+                    <RealTimeLogChart traces={realTimeTraces} />
+                </div>
+            </div>
+
+            {/* RIGHT COLUMN: Controls & Analysis */}
+            <div className="col-span-4 flex flex-col space-y-6 h-full">
+                {/* Control Panel */}
+                <div className="bg-slate-900 text-white p-6 rounded-[40px] shadow-2xl flex-shrink-0">
+                    <div className="flex justify-between items-center mb-6">
+                        <h4 className="text-[10px] font-black text-blue-400 uppercase tracking-widest">Physics Parameters</h4>
+                        <button 
+                            onClick={runBatchFit}
+                            disabled={isFitting || fitSelectedGroups.size === 0}
+                            className={`px-4 py-2 rounded-xl font-black uppercase text-[9px] shadow-lg active:scale-95 transition-all ${isFitting ? 'bg-slate-700 text-slate-400' : 'bg-blue-500 hover:bg-blue-400 text-white'}`}
+                        >
+                            {isFitting ? 'Fit...' : '▶ Run'}
+                        </button>
+                    </div>
+                    
+                    <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-1">
+                            <label className="text-[8px] font-black text-slate-500 uppercase ml-1">Pw (cm/s)</label>
+                            <input 
+                                type="number" value={pwValue} onChange={e => setPwValue(Number(e.target.value))} step="0.0001"
+                                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-2 text-[10px] font-bold outline-none focus:border-blue-500 transition-colors"
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <label className="text-[8px] font-black text-slate-500 uppercase ml-1">Frame dt (s)</label>
+                            <input 
+                                type="number" value={frameInterval} onChange={e => setFrameInterval(Number(e.target.value))} step="0.01"
+                                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-2 text-[10px] font-bold outline-none focus:border-blue-500 transition-colors"
+                            />
+                        </div>
+                         <div className="space-y-1">
+                            <label className="text-[8px] font-black text-slate-500 uppercase ml-1">Bg Int.</label>
+                            <input 
+                                type="number" value={fitBgValue} onChange={e => setFitBgValue(Number(e.target.value))}
+                                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-2 text-[10px] font-bold outline-none focus:border-blue-500 transition-colors"
+                            />
+                        </div>
+                        <div className="space-y-1">
+                            <label className="text-[8px] font-black text-slate-500 uppercase ml-1">Threshold</label>
+                            <input 
+                                type="number" value={fitThreshold} onChange={e => setFitThreshold(Number(e.target.value))} step="0.0001"
+                                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-2 text-[10px] font-bold outline-none focus:border-blue-500 transition-colors"
+                            />
+                        </div>
+                        <div className="space-y-1 col-span-2">
+                            <label className="text-[8px] font-black text-slate-500 uppercase ml-1">Intensity Field</label>
+                            <select 
+                                value={fitMapping.intensity} onChange={e => setFitMapping(p => ({...p, intensity: e.target.value}))}
+                                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-2 text-[10px] font-bold outline-none focus:border-blue-500 transition-colors"
+                            >
+                                {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
+                            </select>
+                        </div>
+                        <div className="space-y-1 col-span-2">
+                            <label className="text-[8px] font-black text-slate-500 uppercase ml-1">Radius Field</label>
+                            <select 
+                                value={fitMapping.radius} onChange={e => setFitMapping(p => ({...p, radius: e.target.value}))}
+                                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2 py-2 text-[10px] font-bold outline-none focus:border-blue-500 transition-colors"
+                            >
+                                {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Analysis & Distributions */}
+                <div className="flex-1 bg-white p-6 rounded-[40px] border border-slate-100 shadow-xl flex flex-col overflow-hidden">
+                    <div className="mb-4 flex justify-between items-center border-b pb-2">
+                         <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Fit Results</h4>
+                    </div>
+                    
+                    <div className="flex flex-col space-y-4 h-full overflow-y-auto pr-1">
+                         <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 shrink-0">
+                            <h4 className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-2">Groups</h4>
+                            <div className="flex flex-wrap gap-2">
+                                {Array.from(visibleGroups).map((gn, i) => (
+                                <label key={gn} className={`flex items-center space-x-2 px-2 py-1 rounded-lg border text-[8px] font-bold cursor-pointer select-none transition-all ${fitSelectedGroups.has(gn) ? 'bg-slate-900 border-transparent text-white shadow-md' : 'bg-white border-slate-200 text-slate-400'}`}>
+                                    <input 
+                                        type="checkbox" className="hidden" 
+                                        checked={fitSelectedGroups.has(gn)} 
+                                        onChange={() => {
+                                            const next = new Set(fitSelectedGroups);
+                                            if (next.has(gn)) next.delete(gn); else next.add(gn);
+                                            setFitSelectedGroups(next);
+                                        }} 
+                                    />
+                                    <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: GROUP_COLORS[i % GROUP_COLORS.length] }}></div>
+                                    <span>{gn}</span>
+                                </label>
+                                ))}
+                            </div>
+                         </div>
+                         
+                         <div className="h-[150px] shrink-0">
+                             <SimpleDistributionChart data={pfData} title="Permeability (Pf)" />
+                         </div>
+                         <div className="h-[150px] shrink-0">
+                             <SimpleDistributionChart data={r2Data} title="Fit R²" />
+                         </div>
+                    </div>
+                </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderAnalytics = () => {
+    // Preparation for Box Plot
+    const boxPlotData = useMemo(() => {
+        if (!analyticsField) return [];
+        const groups: Record<string, number[]> = {};
+        (trackFeatures as TrajectoryFeature[]).forEach((tf) => {
+            if (analyticsVisibleGroups.has(tf.group)) {
+                const val = tf.stats[analyticsField]?.[analyticsMode];
+                if (val !== undefined && !isNaN(val)) {
+                    if (!groups[tf.group]) groups[tf.group] = [];
+                    groups[tf.group].push(val);
+                }
+            }
+        });
+        return Object.entries(groups).map(([group, values]) => ({ group, values }));
+    }, [trackFeatures, analyticsField, analyticsMode, analyticsVisibleGroups]);
+
+    return (
+      <div className="p-10 h-full bg-slate-50 overflow-y-auto space-y-8 pb-32">
+        <div className="max-w-7xl mx-auto space-y-10">
+          <div className="flex justify-between items-end">
+             <div>
+               <h2 className="text-4xl font-black text-slate-900 tracking-tighter">4. Summary Analytics</h2>
+               <p className="text-sm text-slate-400 font-bold uppercase tracking-widest mt-2">Compare populations and correlations</p>
+             </div>
+             <div className="flex space-x-4">
+                <button onClick={() => exportChartAsPng('analytics-boxplot', 'boxplot_analysis')} className="bg-white border border-slate-200 text-slate-600 px-6 py-3 rounded-2xl text-[10px] font-black uppercase shadow-sm hover:bg-slate-50 transition-all">Export BoxPlot</button>
+                <button onClick={() => exportChartAsPng('analytics-scatter', 'scatter_analysis')} className="bg-white border border-slate-200 text-slate-600 px-6 py-3 rounded-2xl text-[10px] font-black uppercase shadow-sm hover:bg-slate-50 transition-all">Export Scatter</button>
+             </div>
+          </div>
+
+          {/* Controls */}
+          <div className="bg-white p-6 rounded-[30px] shadow-xl border border-slate-100 grid grid-cols-12 gap-8 items-end">
+              <div className="col-span-12 mb-2">
+                 <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Active Groups</h4>
+                 <div className="flex flex-wrap gap-2 mt-2">
+                    {Array.from(visibleGroups).map((gn, i) => (
+                        <label key={gn} className={`flex items-center space-x-2 px-3 py-1.5 rounded-xl border text-[9px] font-bold cursor-pointer select-none transition-all ${analyticsVisibleGroups.has(gn) ? 'bg-slate-900 border-transparent text-white shadow-md' : 'bg-slate-50 border-slate-200 text-slate-400'}`}>
+                            <input 
+                                type="checkbox" className="hidden" 
+                                checked={analyticsVisibleGroups.has(gn)} 
+                                onChange={() => {
+                                    const next = new Set(analyticsVisibleGroups);
+                                    if (next.has(gn)) next.delete(gn); else next.add(gn);
+                                    setAnalyticsVisibleGroups(next);
+                                }} 
+                            />
+                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: GROUP_COLORS[i % GROUP_COLORS.length] }}></div>
+                            <span>{gn}</span>
+                        </label>
                     ))}
-                  </div>
-               </div>
-               <div id="scatterplot-guv-container" className="col-span-9 bg-white p-12 rounded-[50px] border border-slate-100 h-[600px] shadow-2xl overflow-hidden">
-                  <ScatterPlotGUV id="guv-scatter-plot-svg" features={activeTrackFeatures} xField={analyticsXField} yField={analyticsYField} xMode={analyticsXMode} yMode={analyticsYMode} visibleGroups={analyticsVisibleGroups} />
-               </div>
-            </div>
+                 </div>
+              </div>
+          </div>
+
+          <div className="grid grid-cols-12 gap-8 h-[600px]">
+             {/* LEFT: Box Plot */}
+             <div className="col-span-6 flex flex-col space-y-6">
+                <div className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-2xl flex-1 flex flex-col" id="analytics-boxplot">
+                    <div className="flex justify-between items-center mb-6">
+                         <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Population Distribution</h4>
+                         <div className="flex space-x-2">
+                             <select value={analyticsField} onChange={e => setAnalyticsField(e.target.value)} className="bg-slate-50 border-none rounded-lg px-2 py-1 text-[9px] font-black uppercase outline-none focus:ring-1 ring-blue-200">
+                                {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
+                             </select>
+                             <select value={analyticsMode} onChange={e => setAnalyticsMode(e.target.value as any)} className="bg-slate-50 border-none rounded-lg px-2 py-1 text-[9px] font-black uppercase outline-none focus:ring-1 ring-blue-200">
+                                <option value="mean">Mean</option>
+                                <option value="max">Max</option>
+                                <option value="min">Min</option>
+                                <option value="variance">Var</option>
+                                <option value="cv">CV</option>
+                             </select>
+                         </div>
+                    </div>
+                    <div className="flex-1">
+                        <BoxPlotChart data={boxPlotData} />
+                    </div>
+                </div>
+             </div>
+
+             {/* RIGHT: Scatter Plot */}
+             <div className="col-span-6 flex flex-col space-y-6">
+                <div className="bg-white p-8 rounded-[40px] border border-slate-100 shadow-2xl flex-1 flex flex-col" id="analytics-scatter">
+                    <div className="flex justify-between items-center mb-6">
+                         <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Correlation Analysis</h4>
+                         <div className="flex flex-col space-y-1 items-end">
+                            <div className="flex space-x-2 items-center">
+                                <span className="text-[8px] font-black text-slate-300 uppercase">X-Axis</span>
+                                <select value={analyticsXField} onChange={e => setAnalyticsXField(e.target.value)} className="bg-slate-50 border-none rounded-lg px-2 py-1 text-[9px] font-black uppercase outline-none w-24">
+                                    {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
+                                </select>
+                                <select value={analyticsXMode} onChange={e => setAnalyticsXMode(e.target.value as any)} className="bg-slate-50 border-none rounded-lg px-2 py-1 text-[9px] font-black uppercase outline-none w-16">
+                                    <option value="mean">Mean</option>
+                                    <option value="max">Max</option>
+                                    <option value="min">Min</option>
+                                </select>
+                            </div>
+                            <div className="flex space-x-2 items-center">
+                                <span className="text-[8px] font-black text-slate-300 uppercase">Y-Axis</span>
+                                <select value={analyticsYField} onChange={e => setAnalyticsYField(e.target.value)} className="bg-slate-50 border-none rounded-lg px-2 py-1 text-[9px] font-black uppercase outline-none w-24">
+                                    {numericFields.map(f => <option key={f} value={f}>{f}</option>)}
+                                </select>
+                                <select value={analyticsYMode} onChange={e => setAnalyticsYMode(e.target.value as any)} className="bg-slate-50 border-none rounded-lg px-2 py-1 text-[9px] font-black uppercase outline-none w-16">
+                                    <option value="mean">Mean</option>
+                                    <option value="max">Max</option>
+                                    <option value="min">Min</option>
+                                </select>
+                            </div>
+                         </div>
+                    </div>
+                    <div className="flex-1">
+                        <ScatterPlotGUV 
+                            id="scatter-plot-main"
+                            features={trackFeatures as TrajectoryFeature[]}
+                            xField={analyticsXField}
+                            yField={analyticsYField}
+                            xMode={analyticsXMode}
+                            yMode={analyticsYMode}
+                            visibleGroups={analyticsVisibleGroups}
+                        />
+                    </div>
+                </div>
+             </div>
           </div>
         </div>
       </div>
@@ -645,35 +850,21 @@ const App: React.FC = () => {
 
   return (
     <div className="flex h-screen w-full bg-slate-50 overflow-hidden font-sans text-slate-900 select-none">
-      <Sidebar currentTab={currentTab} setTab={setTab} />
+      <Sidebar 
+        currentTab={currentTab} setTab={setTab} onResetSession={resetSession} dataActive={rawData.length > 0} 
+      />
       <main className="flex-1 flex flex-col h-full relative">
         <header className="h-20 bg-white/95 backdrop-blur-3xl border-b border-slate-200 px-12 flex items-center justify-between shadow-sm z-50 sticky top-0">
           <div className="flex items-center space-x-8">
             <span className="font-black text-slate-900 text-3xl tracking-tighter">GUV Studio</span>
-            {rawData.length > 0 && <div className="text-[10px] bg-blue-600 text-white px-5 py-1.5 rounded-2xl font-black border border-blue-400 uppercase tracking-widest shadow-lg shadow-blue-200">Active Analysis</div>}
-          </div>
-          <div className="flex items-center space-x-6 text-[10px] font-black text-slate-400 uppercase tracking-widest">
-            {rawData.length > 0 && (
-              <button 
-                onClick={resetSession} 
-                className="text-red-500 border border-red-100 bg-red-50/50 px-6 py-2.5 rounded-xl hover:bg-red-50 hover:border-red-200 transition-all font-black uppercase tracking-widest"
-              >
-                New Session
-              </button>
-            )}
-            <span className="bg-slate-50 px-4 py-2 rounded-xl text-slate-400">Pro Edition v1.2</span>
+            {rawData.length > 0 && <div className="text-[10px] bg-blue-600 text-white px-5 py-1.5 rounded-2xl font-black border border-blue-400 uppercase tracking-widest shadow-lg shadow-blue-200">Session Active</div>}
           </div>
         </header>
         <div className="flex-1 overflow-hidden">
           {currentTab === 'import' && renderImport()}
           {currentTab === 'filter' && renderFilter()}
+          {currentTab === 'fitting' && renderFitting()}
           {currentTab === 'analytics' && renderAnalytics()}
-          {(currentTab === 'trajectory' || currentTab === 'fitting') && (
-            <div className="flex-1 flex flex-col items-center justify-center text-slate-200 space-y-6">
-              <span className="text-9xl opacity-30">⚛️</span>
-              <p className="text-2xl font-black uppercase tracking-widest italic opacity-30">Kinetics Fitting Engine Offline</p>
-            </div>
-          )}
         </div>
       </main>
     </div>
