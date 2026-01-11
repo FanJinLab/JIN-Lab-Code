@@ -4,16 +4,17 @@ import { GROUP_COLORS } from '../constants';
 import { TrajectoryFeature } from '../types';
 
 interface InteractiveHistogramProps {
-  features: TrajectoryFeature[]; // Updated from any[] to resolve indexing issues with unknown types.
+  features: TrajectoryFeature[]; 
   field: string;
   mode: 'first' | 'last' | 'mean' | 'min' | 'max' | 'variance' | 'cv';
   scale: 'linear' | 'log';
   range: [number, number];
   onRangeChange: (range: [number, number]) => void;
+  colorMap?: Record<string, string>;
 }
 
 const InteractiveHistogram: React.FC<InteractiveHistogramProps> = ({ 
-  features, field, mode, scale, range, onRangeChange 
+  features, field, mode, scale, range, onRangeChange, colorMap 
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [dragging, setDragging] = useState<'min' | 'max' | null>(null);
@@ -39,7 +40,6 @@ const InteractiveHistogram: React.FC<InteractiveHistogramProps> = ({
 
   const bins = useMemo(() => {
     const binCount = 40;
-    // Fix: Explicitly type groups as string[] to ensure it can be used as an index type.
     const groups = Array.from(new Set(dataPoints.map(p => p.group))) as string[];
     let minVal = bounds.min;
     let maxVal = bounds.max;
@@ -54,7 +54,6 @@ const InteractiveHistogram: React.FC<InteractiveHistogramProps> = ({
         const binStart = Math.pow(10, logMin + i * logStep);
         const binEnd = Math.pow(10, logMin + (i + 1) * logStep);
         const res: any = { start: binStart, end: binEnd };
-        // Fix: g is now string, indexing into any object is allowed.
         groups.forEach(g => { res[g] = 0; });
         return res;
       });
@@ -62,7 +61,6 @@ const InteractiveHistogram: React.FC<InteractiveHistogramProps> = ({
       dataPoints.forEach(p => {
         const pVal = Math.max(p.val, 0.0001);
         const idx = Math.min(Math.floor((Math.log10(pVal) - logMin) / logStep), binCount - 1);
-        // Fix: p.group is string, resolved from TrajectoryFeature type.
         if (b[idx]) b[idx][p.group]++;
       });
       return b;
@@ -76,7 +74,6 @@ const InteractiveHistogram: React.FC<InteractiveHistogramProps> = ({
 
       dataPoints.forEach(p => {
         const idx = Math.min(Math.floor((p.val - minVal) / step), binCount - 1);
-        // Fix: indexing with string group name is now safe.
         if (b[idx] && b[idx][p.group] !== undefined) b[idx][p.group]++;
       });
       return b;
@@ -127,55 +124,64 @@ const InteractiveHistogram: React.FC<InteractiveHistogramProps> = ({
     <div className="flex flex-col h-full w-full">
       <div 
         ref={containerRef}
-        className="relative flex-1 bg-slate-50 border border-slate-200 rounded-xl overflow-hidden cursor-crosshair select-none"
+        className="relative flex-1 bg-slate-50 border border-slate-200 rounded-xl cursor-crosshair select-none"
         onMouseMove={handleMouseMove}
         onMouseUp={() => setDragging(null)}
         onMouseLeave={() => setDragging(null)}
       >
-        <svg className="absolute inset-0 w-full h-full">
-          {bins.map((b, i) => {
-            let currentY = 100;
-            const x = (i / bins.length) * 100;
-            const width = (1 / bins.length) * 100;
-            return groupNames.map((gn, gi) => {
-              // Fix: gn is typed as string, resolving index into any-typed bin object.
-              const freq = b[gn] || 0;
-              const h = (freq / maxFreq) * 90;
-              const bar = (
-                <rect 
-                  key={`${i}-${gn}`}
-                  x={`${x}%`} 
-                  y={`${currentY - h}%`} 
-                  width={`${width}%`} 
-                  height={`${h}%`} 
-                  fill={GROUP_COLORS[gi % GROUP_COLORS.length]} 
-                  opacity={0.7}
-                />
-              );
-              currentY -= h;
-              return bar;
-            });
-          })}
-        </svg>
+        <div className="absolute inset-0 overflow-hidden rounded-xl">
+             <svg className="absolute inset-0 w-full h-full">
+            {bins.map((b, i) => {
+                let currentY = 100;
+                const x = (i / bins.length) * 100;
+                const width = (1 / bins.length) * 100;
+                return groupNames.map((gn, gi) => {
+                const freq = b[gn] || 0;
+                const h = (freq / maxFreq) * 90;
+                const barColor = colorMap ? colorMap[gn] : GROUP_COLORS[gi % GROUP_COLORS.length];
+                const bar = (
+                    <rect 
+                    key={`${i}-${gn}`}
+                    x={`${x}%`} 
+                    y={`${currentY - h}%`} 
+                    width={`${width}%`} 
+                    height={`${h}%`} 
+                    fill={barColor} 
+                    opacity={0.7}
+                    />
+                );
+                currentY -= h;
+                return bar;
+                });
+            })}
+            </svg>
+        </div>
 
+        {/* Handles rendered OUTSIDE the overflow-hidden container to prevent clipping */}
         <div 
-          className="absolute top-0 bottom-0 w-1 bg-blue-600 cursor-ew-resize group"
+          className="absolute top-0 bottom-0 w-1 bg-blue-600 cursor-ew-resize group z-20 hover:w-1.5 transition-all"
           style={{ left: getXPos(range[0]) }}
           onMouseDown={() => setDragging('min')}
         >
-          <div className="absolute top-0 left-1/2 -translate-x-1/2 bg-blue-600 text-white text-[9px] font-black px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity z-10">
-            {range[0].toFixed(2)}
+          <div className="absolute top-0 left-1/2 -translate-x-1/2 bg-blue-600 text-white text-[9px] font-black px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity z-10 whitespace-nowrap shadow-md -translate-y-full">
+            Min: {range[0].toFixed(2)}
           </div>
+          <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-3 h-3 bg-blue-600 rounded-full shadow border border-white"></div>
         </div>
         <div 
-          className="absolute top-0 bottom-0 w-1 bg-blue-600 cursor-ew-resize group"
+          className="absolute top-0 bottom-0 w-1 bg-blue-600 cursor-ew-resize group z-20 hover:w-1.5 transition-all"
           style={{ left: getXPos(range[1]) }}
           onMouseDown={() => setDragging('max')}
         >
-          <div className="absolute top-0 left-1/2 -translate-x-1/2 bg-blue-600 text-white text-[9px] font-black px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity z-10">
-            {range[1].toFixed(2)}
+          <div className="absolute top-0 left-1/2 -translate-x-1/2 bg-blue-600 text-white text-[9px] font-black px-1.5 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity z-10 whitespace-nowrap shadow-md -translate-y-full">
+            Max: {range[1].toFixed(2)}
           </div>
+          <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-3 h-3 bg-blue-600 rounded-full shadow border border-white"></div>
         </div>
+        
+        {/* Shading for excluded regions */}
+        <div className="absolute top-0 bottom-0 left-0 bg-slate-900/10 pointer-events-none" style={{ width: getXPos(range[0]) }}></div>
+        <div className="absolute top-0 bottom-0 right-0 bg-slate-900/10 pointer-events-none" style={{ left: getXPos(range[1]) }}></div>
       </div>
       <div className="flex justify-between mt-2 text-[10px] text-slate-400 font-mono">
         <span>{bounds.min.toFixed(1)}</span>

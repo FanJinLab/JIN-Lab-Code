@@ -1,108 +1,171 @@
 
-import React, { useMemo } from 'react';
-import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { GROUP_COLORS } from '../constants';
 import { RealTimeTrace } from '../utils/physicsFitting';
+import { safeMin, safeMax } from '../utils/dataProcess';
 
 interface RealTimeLogChartProps {
   traces: RealTimeTrace[];
+  colorMap?: Record<string, string>;
 }
 
-const RealTimeLogChart: React.FC<RealTimeLogChartProps> = React.memo(({ traces }) => {
-  
-  const { pointData, groupMap } = useMemo(() => {
-    // Aggressive Sampling for Performance (Max 500 points)
-    const pData: any[] = [];
-    const gMap: string[] = [];
-    const processedGroups = new Set<string>();
+const RealTimeLogChart: React.FC<RealTimeLogChartProps> = React.memo(({ traces, colorMap }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
 
-    let totalPoints = 0;
-    traces.forEach(t => totalPoints += t.points.length);
-
-    const MAX_VISUAL_POINTS = 500;
-    const step = totalPoints > MAX_VISUAL_POINTS ? Math.ceil(totalPoints / MAX_VISUAL_POINTS) : 1;
-    let globalIdx = 0;
-
-    traces.forEach((trace) => {
-      if (!processedGroups.has(trace.group)) {
-        processedGroups.add(trace.group);
-        gMap.push(trace.group);
-      }
-      
-      for (let i = 0; i < trace.points.length; i++) {
-         if (globalIdx % step === 0) {
-             const p = trace.points[i];
-             pData.push({ x: p.time, y: p.ln_norm, group: trace.group, id: trace.id });
-         }
-         globalIdx++;
-      }
+  // Compute bounds: Fixed Y [-5, 0], Fixed X [0, MaxTime]
+  const bounds = useMemo(() => {
+    if (traces.length === 0) return { minX: 0, maxX: 100, minY: -5, maxY: 0 };
+    
+    let maxX = 0;
+    
+    // Find absolute max time
+    traces.forEach(t => {
+        // Assuming points are sorted by time, check last point
+        if (t.points.length > 0) {
+            const tMax = t.points[t.points.length - 1].time;
+            if (tMax > maxX) maxX = tMax;
+        }
     });
 
-    return { pointData: pData, groupMap: gMap };
+    if (maxX === 0) maxX = 100;
+
+    return { minX: 0, maxX: maxX, minY: -5, maxY: 0 };
   }, [traces]);
 
-  const groups = groupMap.sort();
-  
-  // Calculate domains
-  const xValues = pointData.map(p => p.x);
-  const xMax = xValues.length > 0 ? Math.max(...xValues) : 100;
+  // Handle Resize
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const observer = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setDimensions({ width, height });
+    });
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  // Draw
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || dimensions.width === 0 || dimensions.height === 0) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Retina support
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = dimensions.width * dpr;
+    canvas.height = dimensions.height * dpr;
+    canvas.style.width = `${dimensions.width}px`;
+    canvas.style.height = `${dimensions.height}px`;
+    ctx.scale(dpr, dpr);
+
+    // Clear
+    ctx.clearRect(0, 0, dimensions.width, dimensions.height);
+
+    if (traces.length === 0) {
+        ctx.fillStyle = '#cbd5e1';
+        ctx.font = 'bold 12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('NO DATA', dimensions.width/2, dimensions.height/2);
+        return;
+    }
+
+    const { minX, maxX, minY, maxY } = bounds;
+    const W = dimensions.width;
+    const H = dimensions.height;
+    const padding = { left: 40, right: 20, top: 20, bottom: 30 };
+    const chartW = W - padding.left - padding.right;
+    const chartH = H - padding.top - padding.bottom;
+
+    const toX = (val: number) => padding.left + ((val - minX) / (maxX - minX)) * chartW;
+    const toY = (val: number) => padding.top + chartH - ((val - minY) / (maxY - minY)) * chartH;
+
+    // Grid - REMOVED as requested for cleaner view
+    ctx.strokeStyle = '#f1f5f9';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    // Only draw Axes
+    ctx.moveTo(padding.left, padding.top); 
+    ctx.lineTo(padding.left, padding.top + chartH); // Y Axis
+    ctx.lineTo(padding.left + chartW, padding.top + chartH); // X Axis
+    ctx.stroke();
+
+    // Data Points
+    // Group traces first
+    const tracesByGroup: Record<string, RealTimeTrace[]> = {};
+    traces.forEach(t => {
+        if(!tracesByGroup[t.group]) tracesByGroup[t.group] = [];
+        tracesByGroup[t.group].push(t);
+    });
+    
+    const sortedGroups = Object.keys(tracesByGroup).sort();
+    
+    sortedGroups.forEach((group, gIdx) => {
+        const color = (colorMap && colorMap[group]) ? colorMap[group] : GROUP_COLORS[gIdx % GROUP_COLORS.length];
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1; // Thin stroke for hollow circles
+        
+        const groupTraces = tracesByGroup[group];
+        
+        ctx.beginPath();
+        for (const t of groupTraces) {
+            for (const p of t.points) {
+                // Skip if strictly out of Y bounds (X bounds are fixed 0-Max)
+                if (p.val < minY || p.val > maxY) continue;
+
+                const px = toX(p.time);
+                const py = toY(p.val);
+                
+                // Draw hollow circle (Radius 2)
+                ctx.moveTo(px + 2, py);
+                ctx.arc(px, py, 2, 0, 2 * Math.PI);
+            }
+        }
+        ctx.stroke();
+    });
+
+    // Axes Labels
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    
+    // X
+    for(let i=0; i<=5; i++) {
+        const val = minX + (maxX - minX) * (i/5);
+        ctx.fillText(val.toFixed(0), padding.left + (chartW * i)/5, H - 10);
+    }
+    // Y
+    ctx.textAlign = 'right';
+    for(let i=0; i<=5; i++) {
+        const val = maxY - (maxY - minY) * (i/5);
+        ctx.fillText(val.toFixed(1), padding.left - 5, padding.top + (chartH * i)/5 + 3);
+    }
+    
+    // Titles
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.fillText('Time (s)', padding.left + chartW/2, H - 2);
+
+    ctx.save();
+    ctx.translate(10, H/2);
+    ctx.rotate(-Math.PI/2);
+    ctx.fillText('ln(Norm)', 0, 0);
+    ctx.restore();
+
+  }, [traces, dimensions, bounds, colorMap]);
 
   return (
     <div className="w-full h-full bg-white rounded-xl overflow-hidden flex flex-col">
-        {/* Header */}
-        <div className="px-6 py-4 border-b border-slate-50 bg-slate-50/50 flex flex-col space-y-3 z-10">
+        <div className="px-6 py-4 border-b border-slate-50 bg-slate-50/50 flex flex-col space-y-3 z-10 shrink-0">
             <div className="flex justify-between items-center">
                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Real Time Decay</span>
+                <span className="text-[9px] font-bold text-slate-300">{traces.length} Tracks</span>
             </div>
         </div>
-
-        <div className="flex-1 min-h-0">
-            <ResponsiveContainer width="100%" height="100%">
-                <ScatterChart margin={{ top: 20, right: 10, bottom: 20, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                <XAxis 
-                    type="number" 
-                    dataKey="x" 
-                    name="Time" 
-                    stroke="#94a3b8" 
-                    fontSize={10}
-                    domain={[0, 'auto']}
-                    allowDataOverflow={false} 
-                    label={{ value: 'Time (s)', position: 'insideBottom', offset: -10, fontSize: 10, fill: '#64748b', fontWeight: 'bold' }}
-                />
-                <YAxis 
-                    type="number" 
-                    dataKey="y" 
-                    domain={[-5, 0]} 
-                    ticks={[-5, -4, -3, -2, -1, 0]}
-                    allowDataOverflow={true}
-                    name="ln(Norm)" 
-                    stroke="#94a3b8" 
-                    fontSize={10}
-                    label={{ value: 'ln((I-Iend)/(I0-Iend))', angle: -90, position: 'insideLeft', offset: 10, fontSize: 10, fill: '#64748b', fontWeight: 'bold' }}
-                />
-                <Tooltip cursor={{ strokeDasharray: '3 3' }} isAnimationActive={false} />
-                <Legend verticalAlign="top" height={36} iconSize={8} wrapperStyle={{fontSize: '9px'}} />
-
-                {groups.map((gn, i) => {
-                    const groupColor = GROUP_COLORS[i % GROUP_COLORS.length];
-                    const groupPoints = pointData.filter(p => p.group === gn);
-                    return (
-                        <Scatter 
-                            key={`rt-points-${gn}`}
-                            name={`${gn}`} 
-                            data={groupPoints} 
-                            fill={groupColor} 
-                            fillOpacity={0.3}
-                            line={false}
-                            isAnimationActive={false}
-                            shape="circle" 
-                            legendType="circle"
-                        />
-                    );
-                })}
-                </ScatterChart>
-            </ResponsiveContainer>
+        <div ref={containerRef} className="flex-1 min-h-0 relative">
+            <canvas ref={canvasRef} className="block" />
         </div>
     </div>
   );

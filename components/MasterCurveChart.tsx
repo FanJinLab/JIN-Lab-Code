@@ -1,6 +1,5 @@
 
-import React, { useMemo, useState, useEffect } from 'react';
-import { ScatterChart, Scatter, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, ReferenceLine } from 'recharts';
+import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { GROUP_COLORS } from '../constants';
 import { TraceFitResult, TransformedTrace } from '../utils/physicsFitting';
 
@@ -11,65 +10,183 @@ interface MasterCurveChartProps {
   setFitRange: (range: [number, number]) => void;
   maxTau: number;
   threshold: number;
+  colorMap?: Record<string, string>;
 }
 
 const MasterCurveChart: React.FC<MasterCurveChartProps> = React.memo(({ 
-  traces, fitResults, fitRange, maxTau, threshold, setFitRange 
+  traces, fitResults, fitRange, maxTau, threshold, setFitRange, colorMap 
 }) => {
-  
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
   const [localRange, setLocalRange] = useState<[number, number]>(fitRange);
 
   useEffect(() => {
     setLocalRange(fitRange);
   }, [fitRange]);
 
-  const { pointData, lineData, groupMap } = useMemo(() => {
-    // 1. Aggressive Sampling for Performance (Max 500 points visible)
-    const pData: any[] = [];
-    const gMap: string[] = [];
-    const processedGroups = new Set<string>();
+  // Bounds
+  const bounds = useMemo(() => {
+    return { minX: fitRange[0], maxX: fitRange[1], minY: -5, maxY: 0 };
+  }, [fitRange]);
 
-    let totalPoints = 0;
-    traces.forEach(t => totalPoints += t.points.length);
+  // Resize
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const observer = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect;
+      setDimensions({ width, height });
+    });
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
 
-    const MAX_VISUAL_POINTS = 500; 
-    const step = totalPoints > MAX_VISUAL_POINTS ? Math.ceil(totalPoints / MAX_VISUAL_POINTS) : 1;
-    let globalIdx = 0;
+  // Draw
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || dimensions.width === 0 || dimensions.height === 0) return;
 
-    traces.forEach((trace) => {
-      if (!processedGroups.has(trace.group)) {
-        processedGroups.add(trace.group);
-        gMap.push(trace.group);
-      }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
-      for (let i = 0; i < trace.points.length; i++) {
-         if (globalIdx % step === 0) {
-             const p = trace.points[i];
-             pData.push({ x: p.tau_w, y: p.ln_y, group: trace.group, id: trace.id });
-         }
-         globalIdx++;
-      }
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = dimensions.width * dpr;
+    canvas.height = dimensions.height * dpr;
+    canvas.style.width = `${dimensions.width}px`;
+    canvas.style.height = `${dimensions.height}px`;
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, dimensions.width, dimensions.height);
+
+    if (traces.length === 0) {
+        ctx.fillStyle = '#cbd5e1';
+        ctx.font = 'bold 12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('NO DATA', dimensions.width/2, dimensions.height/2);
+        return;
+    }
+
+    const { minX, maxX, minY, maxY } = bounds;
+    const W = dimensions.width;
+    const H = dimensions.height;
+    const padding = { left: 40, right: 20, top: 10, bottom: 30 };
+    const chartW = W - padding.left - padding.right;
+    const chartH = H - padding.top - padding.bottom;
+
+    const toX = (val: number) => {
+        if (maxX === minX) return padding.left;
+        return padding.left + ((val - minX) / (maxX - minX)) * chartW;
+    }
+    const toY = (val: number) => padding.top + chartH - ((val - minY) / (maxY - minY)) * chartH;
+
+    // Clipping region for data
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(padding.left, padding.top, chartW, chartH);
+    ctx.clip();
+
+    // 1. Draw Points (Hollow Circles)
+    const tracesByGroup: Record<string, TransformedTrace[]> = {};
+    traces.forEach(t => {
+        if(!tracesByGroup[t.group]) tracesByGroup[t.group] = [];
+        tracesByGroup[t.group].push(t);
+    });
+    
+    Object.keys(tracesByGroup).sort().forEach((group, gIdx) => {
+        const color = (colorMap && colorMap[group]) ? colorMap[group] : GROUP_COLORS[gIdx % GROUP_COLORS.length];
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1; // Thin lines for circle outline
+        
+        ctx.beginPath();
+        for (const t of tracesByGroup[group]) {
+            for (const p of t.points) {
+                // Optimization: Don't draw if way out of bounds
+                if (p.tau_w < minX - (maxX-minX) || p.tau_w > maxX + (maxX-minX)) continue;
+                
+                const px = toX(p.tau_w);
+                const py = toY(p.ln_y);
+                
+                // Draw hollow circle radius 2
+                ctx.moveTo(px + 2, py);
+                ctx.arc(px, py, 2, 0, 2 * Math.PI);
+            }
+        }
+        ctx.stroke();
     });
 
-    const lData: any[] = [];
+    // 2. Draw Fit Lines (Thinner, Transparent)
+    ctx.globalAlpha = 0.7; // Transparency
+    ctx.lineWidth = 1.5; // Thinner
     fitResults.forEach(res => {
-        lData.push({
-            group: res.group,
-            data: res.fitLine.map(p => ({ x: p.tau_w, y: p.ln_y }))
-        });
+       const c = (colorMap && colorMap[res.group]) ? colorMap[res.group] : '#000';
+       ctx.strokeStyle = c;
+       ctx.beginPath();
+       const start = res.fitLine[0];
+       const end = res.fitLine[1];
+       ctx.moveTo(toX(start.tau_w), toY(start.ln_y));
+       ctx.lineTo(toX(end.tau_w), toY(end.ln_y));
+       ctx.stroke();
     });
+    ctx.globalAlpha = 1.0;
 
-    return { pointData: pData, lineData: lData, groupMap: gMap };
-  }, [traces, fitResults]);
+    ctx.restore(); // remove clip
 
-  const groups = groupMap.sort();
-  
-  const yMin = -5;
-  const yMax = 0;
-  
-  // X Domain STRICTLY follows fitRange (Auto-adapted in parent or set by user)
-  const xMin = fitRange[0];
-  const xMax = fitRange[1];
+    // 3. Grid & Border (Only Axes, No Grid)
+    ctx.strokeStyle = '#f1f5f9';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padding.left, padding.top);
+    ctx.lineTo(padding.left, padding.top + chartH); // Y Axis
+    ctx.lineTo(padding.left + chartW, padding.top + chartH); // X Axis
+    ctx.stroke();
+
+    // 4. Vertical Reference Lines (Fit Window)
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath();
+    const x1 = toX(fitRange[0]);
+    const x2 = toX(fitRange[1]);
+    
+    if (x1 >= padding.left && x1 <= padding.left + chartW) {
+        ctx.moveTo(x1, padding.top);
+        ctx.lineTo(x1, padding.top + chartH);
+    }
+    if (x2 >= padding.left && x2 <= padding.left + chartW) {
+        ctx.moveTo(x2, padding.top);
+        ctx.lineTo(x2, padding.top + chartH);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 5. Axes Labels
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    
+    // X Labels
+    for(let i=0; i<=5; i++) {
+        const val = minX + (maxX - minX) * (i/5);
+        ctx.fillText(val.toFixed(0), padding.left + (chartW * i)/5, H - 10);
+    }
+    // Y Labels
+    ctx.textAlign = 'right';
+    for(let i=0; i<=5; i++) {
+        const val = maxY - (maxY - minY) * (i/5);
+        ctx.fillText(val.toFixed(1), padding.left - 5, padding.top + (chartH * i)/5 + 3);
+    }
+
+    // Titles
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 10px sans-serif';
+    ctx.fillText('τw (Dimensionless)', padding.left + chartW/2, H - 2);
+
+    ctx.save();
+    ctx.translate(10, H/2);
+    ctx.rotate(-Math.PI/2);
+    ctx.fillText('ln(y)', 0, 0);
+    ctx.restore();
+
+  }, [traces, fitResults, dimensions, bounds, colorMap, fitRange]);
 
   const handleSliderChange = (index: 0 | 1, value: number) => {
       const newRange = [...localRange] as [number, number];
@@ -116,7 +233,7 @@ const MasterCurveChart: React.FC<MasterCurveChartProps> = React.memo(({
         `}</style>
 
         {/* Header with Range Sliders */}
-        <div className="px-6 py-4 border-b border-slate-50 bg-slate-50/50 flex flex-col space-y-3 z-10">
+        <div className="px-6 py-4 border-b border-slate-50 bg-slate-50/50 flex flex-col space-y-3 z-10 shrink-0">
             <div className="flex justify-between items-center">
                 <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Fit Window (τ)</span>
                 <div className="flex flex-col items-end">
@@ -163,73 +280,8 @@ const MasterCurveChart: React.FC<MasterCurveChartProps> = React.memo(({
             </div>
         </div>
 
-        <div className="flex-1 min-h-0">
-            <ResponsiveContainer width="100%" height="100%">
-                <ScatterChart margin={{ top: 20, right: 10, bottom: 20, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
-                <XAxis 
-                    type="number" 
-                    dataKey="x" 
-                    name="Dimensionless Time" 
-                    stroke="#94a3b8" 
-                    fontSize={10}
-                    domain={[xMin, xMax]}
-                    allowDataOverflow={true} 
-                    label={{ value: 'τw', position: 'insideBottom', offset: -10, fontSize: 10, fill: '#64748b', fontWeight: 'bold' }}
-                />
-                <YAxis 
-                    type="number" 
-                    dataKey="y" 
-                    domain={[yMin, yMax]} 
-                    ticks={[-5, -4, -3, -2, -1, 0]}
-                    allowDataOverflow={true}
-                    name="ln(y)" 
-                    stroke="#94a3b8" 
-                    fontSize={10}
-                    label={{ value: 'ln(y)', angle: -90, position: 'insideLeft', offset: 10, fontSize: 10, fill: '#64748b', fontWeight: 'bold' }}
-                />
-                <Tooltip cursor={{ strokeDasharray: '3 3' }} isAnimationActive={false} />
-                <Legend verticalAlign="top" height={36} iconSize={8} wrapperStyle={{fontSize: '9px'}} />
-
-                {groups.map((gn, i) => {
-                    const groupColor = GROUP_COLORS[i % GROUP_COLORS.length];
-                    const groupPoints = pointData.filter(p => p.group === gn);
-                    return (
-                        <Scatter 
-                            key={`points-${gn}`}
-                            name={`${gn}`} 
-                            data={groupPoints} 
-                            fill={groupColor} 
-                            fillOpacity={0.3}
-                            line={false}
-                            isAnimationActive={false}
-                            shape="circle" 
-                            legendType="circle"
-                        />
-                    );
-                })}
-
-                {lineData.map((line, i) => {
-                    const gIndex = groups.indexOf(line.group);
-                    const groupColor = GROUP_COLORS[gIndex % GROUP_COLORS.length];
-                    return (
-                        <Scatter
-                            key={`line-${i}`}
-                            data={line.data}
-                            line={{ stroke: groupColor, strokeWidth: 1, strokeOpacity: 0.5 }} 
-                            shape={() => null} 
-                            legendType="none"
-                            isAnimationActive={false}
-                            name={`${line.group} (Fit)`}
-                        />
-                    );
-                })}
-                
-                <ReferenceLine x={fitRange[0]} stroke="black" strokeDasharray="3 3" />
-                <ReferenceLine x={fitRange[1]} stroke="black" strokeDasharray="3 3" />
-                
-                </ScatterChart>
-            </ResponsiveContainer>
+        <div ref={containerRef} className="flex-1 min-h-0 relative">
+            <canvas ref={canvasRef} className="block" />
         </div>
     </div>
   );

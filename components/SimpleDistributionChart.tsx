@@ -1,3 +1,4 @@
+
 import React, { useMemo } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 import { GROUP_COLORS } from '../constants';
@@ -6,9 +7,10 @@ interface SimpleDistributionChartProps {
   data: { group: string; value: number }[];
   title: string;
   unit?: string;
+  colorMap?: Record<string, string>;
 }
 
-const SimpleDistributionChart: React.FC<SimpleDistributionChartProps> = ({ data, title, unit }) => {
+const SimpleDistributionChart: React.FC<SimpleDistributionChartProps> = ({ data, title, unit, colorMap }) => {
   
   const histogramData = useMemo(() => {
     if (data.length === 0) return { bins: [], groups: [] };
@@ -65,7 +67,7 @@ const SimpleDistributionChart: React.FC<SimpleDistributionChartProps> = ({ data,
                     key={grp} 
                     dataKey={grp} 
                     stackId="a" 
-                    fill={GROUP_COLORS[i % GROUP_COLORS.length]} 
+                    fill={colorMap ? colorMap[grp] : GROUP_COLORS[i % GROUP_COLORS.length]} 
                   />
                ))}
             </BarChart>
